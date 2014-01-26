@@ -157,6 +157,7 @@ func accModeName(flags uint32) string {
 	default:
 		return ""
 	}
+	return ""
 }
 
 var openFlagNames = []flagName{
