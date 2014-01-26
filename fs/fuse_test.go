@@ -17,6 +17,7 @@ import (
 import (
 	"bazil.org/fuse"
 	"bazil.org/fuse/fuseutil"
+	"bazil.org/fuse/syscallx"
 )
 
 var fuseRun = flag.String("fuserun", "", "which fuse test to run. runs all if empty.")
@@ -25,7 +26,7 @@ var fuseRun = flag.String("fuserun", "", "which fuse test to run. runs all if em
 func umount(dir string) {
 	err := exec.Command("umount", dir).Run()
 	if err != nil && runtime.GOOS == "linux" {
-		exec.Command("/bin/fusermount", "-u", dir).Run()
+		exec.Command("fusermount", "-u", dir).Run()
 	}
 }
 
@@ -49,7 +50,7 @@ type badRootFS struct{}
 
 func (badRootFS) Root() (Node, fuse.Error) {
 	// pick a really distinct error, to identify it later
-	return nil, fuse.Errno(syscall.EUCLEAN)
+	return nil, fuse.Errno(syscall.ENAMETOOLONG)
 }
 
 func TestRootErr(t *testing.T) {
@@ -73,7 +74,9 @@ func TestRootErr(t *testing.T) {
 
 	select {
 	case err := <-ch:
-		if err.Error() != "cannot obtain root node: structure needs cleaning" {
+		// TODO this is not be a textual comparison, Serve hides
+		// details
+		if err.Error() != "cannot obtain root node: file name too long" {
 			t.Errorf("Unexpected error: %v", err)
 		}
 	case <-time.After(1 * time.Second):
@@ -93,7 +96,7 @@ func (f testStatFS) Attr() fuse.Attr {
 
 func (f testStatFS) Statfs(req *fuse.StatfsRequest, resp *fuse.StatfsResponse, int Intr) fuse.Error {
 	resp.Blocks = 42
-	resp.Namelen = 13
+	resp.Files = 13
 	return nil
 }
 
@@ -130,8 +133,8 @@ func TestStatfs(t *testing.T) {
 		if g, e := st.Blocks, uint64(42); g != e {
 			t.Errorf("got Blocks = %q; want %q", g, e)
 		}
-		if g, e := st.Namelen, int64(13); g != e {
-			t.Errorf("got Namelen = %q; want %q", g, e)
+		if g, e := st.Files, uint64(13); g != e {
+			t.Errorf("got Files = %d; want %d", g, e)
 		}
 	}
 
@@ -150,8 +153,8 @@ func TestStatfs(t *testing.T) {
 		if g, e := st.Blocks, uint64(42); g != e {
 			t.Errorf("got Blocks = %q; want %q", g, e)
 		}
-		if g, e := st.Namelen, int64(13); g != e {
-			t.Errorf("got Namelen = %q; want %q", g, e)
+		if g, e := st.Files, uint64(13); g != e {
+			t.Errorf("got Files = %d; want %d", g, e)
 		}
 	}
 
@@ -260,6 +263,17 @@ var fuseTests = []struct {
 	{"ftruncate0", &ftruncate{toSize: 0}},
 	{"truncateWithOpen", &truncateWithOpen{}},
 	{"readdir", &readdir{}},
+	{"chmod", &chmod{}},
+	{"open", &open{}},
+	{"fsyncDir", &fsyncDir{}},
+	{"getxattr", &getxattr{}},
+	{"getxattrTooSmall", &getxattrTooSmall{}},
+	{"getxattrSize", &getxattrSize{}},
+	{"listxattr", &listxattr{}},
+	{"listxattrTooSmall", &listxattrTooSmall{}},
+	{"listxattrSize", &listxattrSize{}},
+	{"setxattr", &setxattr{}},
+	{"removexattr", &removexattr{}},
 }
 
 // TO TEST:
@@ -269,7 +283,6 @@ var fuseTests = []struct {
 //	Setattr(*SetattrRequest, *SetattrResponse)
 //	Access(*AccessRequest)
 //	Open(*OpenRequest, *OpenResponse)
-//	Getxattr, Setxattr, Listxattr, Removexattr
 //	Write(*WriteRequest, *WriteResponse)
 //	Flush(*FlushRequest, *FlushResponse)
 
@@ -464,30 +477,44 @@ func (w *writeTruncateFlush) test(path string, t *testing.T) {
 
 // Test Mkdir.
 
+type mkdirSeen struct {
+	name string
+	mode os.FileMode
+}
+
+func (s mkdirSeen) String() string {
+	return fmt.Sprintf("%T{name:%q mod:%v}", s, s.name, s.mode)
+}
+
 type mkdir1 struct {
 	dir
-	seen struct {
-		name chan string
-	}
+	seen chan mkdirSeen
 }
 
 func (f *mkdir1) Mkdir(req *fuse.MkdirRequest, intr Intr) (Node, fuse.Error) {
-	f.seen.name <- req.Name
+	f.seen <- mkdirSeen{
+		name: req.Name,
+		mode: req.Mode,
+	}
 	return &mkdir1{}, nil
 }
 
 func (f *mkdir1) setup(t *testing.T) {
-	f.seen.name = make(chan string, 1)
+	f.seen = make(chan mkdirSeen, 1)
 }
 
 func (f *mkdir1) test(path string, t *testing.T) {
-	err := os.Mkdir(path+"/foo", 0777)
+	// uniform umask needed to make os.Mkdir's mode into something
+	// reproducible
+	defer syscall.Umask(syscall.Umask(0022))
+	err := os.Mkdir(path+"/foo", 0771)
 	if err != nil {
 		t.Error(err)
 		return
 	}
-	if <-f.seen.name != "foo" {
-		t.Error(err)
+	want := mkdirSeen{name: "foo", mode: os.ModeDir | 0751}
+	if g, e := <-f.seen, want; g != e {
+		t.Errorf("mkdir saw %v, want %v", g, e)
 		return
 	}
 }
@@ -504,6 +531,18 @@ func (f *create1) Create(req *fuse.CreateRequest, resp *fuse.CreateResponse, int
 		log.Printf("ERROR create1.Create unexpected name: %q\n", req.Name)
 		return nil, nil, fuse.EPERM
 	}
+	flags := req.Flags
+	// OS X does not pass O_TRUNC here, Linux does; as this is a
+	// Create, that's acceptable
+	flags &^= fuse.OpenFlags(os.O_TRUNC)
+	if g, e := flags, fuse.OpenFlags(os.O_CREATE|os.O_RDWR); g != e {
+		log.Printf("ERROR create1.Create unexpected flags: %v != %v\n", g, e)
+		return nil, nil, fuse.EPERM
+	}
+	if g, e := req.Mode, os.FileMode(0644); g != e {
+		log.Printf("ERROR create1.Create unexpected mode: %v != %v\n", g, e)
+		return nil, nil, fuse.EPERM
+	}
 	return &f.f, &f.f, nil
 }
 
@@ -512,6 +551,9 @@ func (f *create1) setup(t *testing.T) {
 }
 
 func (f *create1) test(path string, t *testing.T) {
+	// uniform umask needed to make os.Create's 0666 into something
+	// reproducible
+	defer syscall.Umask(syscall.Umask(0022))
 	ff, err := os.Create(path + "/foo")
 	if err != nil {
 		t.Errorf("create1 WriteFile: %v", err)
@@ -530,7 +572,7 @@ func (f *create1) test(path string, t *testing.T) {
 	ff.Close()
 }
 
-// Test Create + WriteAll + Remove
+// Test Create + Write + Remove
 
 type create3 struct {
 	dir
@@ -936,11 +978,6 @@ type truncate struct {
 	}
 }
 
-// present purely to trigger bugs in WriteAll logic
-func (*truncate) WriteAll(data []byte, intr Intr) fuse.Error {
-	return nil
-}
-
 func (f *truncate) Setattr(req *fuse.SetattrRequest, resp *fuse.SetattrResponse, intr Intr) fuse.Error {
 	f.seen.gotr <- req
 	return nil
@@ -977,11 +1014,6 @@ type ftruncate struct {
 	seen struct {
 		gotr chan *fuse.SetattrRequest
 	}
-}
-
-// present purely to trigger bugs in WriteAll logic
-func (*ftruncate) WriteAll(data []byte, intr Intr) fuse.Error {
-	return nil
 }
 
 func (f *ftruncate) Setattr(req *fuse.SetattrRequest, resp *fuse.SetattrResponse, intr Intr) fuse.Error {
@@ -1029,11 +1061,6 @@ type truncateWithOpen struct {
 	}
 }
 
-// present purely to trigger bugs in WriteAll logic
-func (*truncateWithOpen) WriteAll(data []byte, intr Intr) fuse.Error {
-	return nil
-}
-
 func (f *truncateWithOpen) Setattr(req *fuse.SetattrRequest, resp *fuse.SetattrResponse, intr Intr) fuse.Error {
 	f.seen.gotr <- req
 	return nil
@@ -1058,7 +1085,8 @@ func (f *truncateWithOpen) test(path string, t *testing.T) {
 	if g, e := gotr.Size, uint64(0); g != e {
 		t.Errorf("got Size = %q; want %q", g, e)
 	}
-	if g, e := gotr.Valid&^fuse.SetattrLockOwner, fuse.SetattrSize; g != e {
+	// osxfuse sets SetattrHandle here, linux does not
+	if g, e := gotr.Valid&^(fuse.SetattrLockOwner|fuse.SetattrHandle), fuse.SetattrSize; g != e {
 		t.Errorf("got Valid = %q; want %q", g, e)
 	}
 	t.Logf("Got request: %#v", gotr)
@@ -1103,5 +1131,389 @@ func (f *readdir) test(path string, t *testing.T) {
 		names[2] != "two" {
 		t.Errorf(`expected 3 entries of "one", "three", "two", got: %q`, names)
 		return
+	}
+}
+
+// Test Chmod.
+
+type chmodSeen struct {
+	mode os.FileMode
+}
+
+type chmod struct {
+	file
+	seen chan chmodSeen
+}
+
+func (f *chmod) Setattr(req *fuse.SetattrRequest, resp *fuse.SetattrResponse, intr Intr) fuse.Error {
+	if !req.Valid.Mode() {
+		log.Printf("setattr not a chmod: %v", req.Valid)
+		return fuse.EIO
+	}
+	f.seen <- chmodSeen{mode: req.Mode}
+	return nil
+}
+
+func (f *chmod) setup(t *testing.T) {
+	f.seen = make(chan chmodSeen, 1)
+}
+
+func (f *chmod) test(path string, t *testing.T) {
+	err := os.Chmod(path, 0764)
+	if err != nil {
+		t.Errorf("chmod: %v", err)
+		return
+	}
+	close(f.seen)
+	got := <-f.seen
+	if g, e := got.mode, os.FileMode(0764); g != e {
+		t.Errorf("wrong mode: %v != %v", g, e)
+	}
+}
+
+// Test open
+
+type openSeen struct {
+	dir   bool
+	flags fuse.OpenFlags
+}
+
+func (s openSeen) String() string {
+	return fmt.Sprintf("%T{dir:%v flags:%v}", s, s.dir, s.flags)
+}
+
+type open struct {
+	file
+	seen chan openSeen
+}
+
+func (f *open) Open(req *fuse.OpenRequest, resp *fuse.OpenResponse, intr Intr) (Handle, fuse.Error) {
+	f.seen <- openSeen{dir: req.Dir, flags: req.Flags}
+	// pick a really distinct error, to identify it later
+	return nil, fuse.Errno(syscall.ENAMETOOLONG)
+
+}
+
+func (f *open) setup(t *testing.T) {
+	f.seen = make(chan openSeen, 1)
+}
+
+func (f *open) test(path string, t *testing.T) {
+	// node: mode only matters with O_CREATE
+	fil, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0)
+	if err == nil {
+		t.Error("Open err == nil, expected ENAMETOOLONG")
+		fil.Close()
+		return
+	}
+
+	switch err2 := err.(type) {
+	case *os.PathError:
+		if err2.Err == syscall.ENAMETOOLONG {
+			break
+		}
+		t.Errorf("unexpected inner error: %#v", err2)
+	default:
+		t.Errorf("unexpected error: %v", err)
+	}
+
+	want := openSeen{dir: false, flags: fuse.OpenFlags(os.O_WRONLY | os.O_APPEND)}
+	if runtime.GOOS == "darwin" {
+		// osxfuse does not let O_APPEND through at all
+		//
+		// https://code.google.com/p/macfuse/issues/detail?id=233
+		// https://code.google.com/p/macfuse/issues/detail?id=132
+		// https://code.google.com/p/macfuse/issues/detail?id=133
+		want.flags &^= fuse.OpenFlags(os.O_APPEND)
+	}
+	if g, e := <-f.seen, want; g != e {
+		t.Errorf("open saw %v, want %v", g, e)
+		return
+	}
+}
+
+// Test Fsync on a dir
+
+type fsyncSeen struct {
+	flags uint32
+	dir   bool
+}
+
+type fsyncDir struct {
+	dir
+	seen chan fsyncSeen
+}
+
+func (f *fsyncDir) Fsync(r *fuse.FsyncRequest, intr Intr) fuse.Error {
+	f.seen <- fsyncSeen{flags: r.Flags, dir: r.Dir}
+	return nil
+}
+
+func (f *fsyncDir) setup(t *testing.T) {
+	f.seen = make(chan fsyncSeen, 1)
+}
+
+func (f *fsyncDir) test(path string, t *testing.T) {
+	fil, err := os.Open(path)
+	if err != nil {
+		t.Errorf("fsyncDir open: %v", err)
+		return
+	}
+	defer fil.Close()
+	err = fil.Sync()
+	if err != nil {
+		t.Errorf("fsyncDir sync: %v", err)
+		return
+	}
+
+	close(f.seen)
+	got := <-f.seen
+	want := uint32(0)
+	if runtime.GOOS == "darwin" {
+		// TODO document the meaning of these flags, figure out why
+		// they differ
+		want = 1
+	}
+	if g, e := got.flags, want; g != e {
+		t.Errorf("fsyncDir bad flags: %v != %v", g, e)
+	}
+	if g, e := got.dir, true; g != e {
+		t.Errorf("fsyncDir bad dir: %v != %v", g, e)
+	}
+}
+
+// Test Getxattr
+
+type getxattrSeen struct {
+	name string
+}
+
+type getxattr struct {
+	file
+	seen chan getxattrSeen
+}
+
+func (f *getxattr) Getxattr(req *fuse.GetxattrRequest, resp *fuse.GetxattrResponse, intr Intr) fuse.Error {
+	f.seen <- getxattrSeen{name: req.Name}
+	resp.Xattr = []byte("hello, world")
+	return nil
+}
+
+func (f *getxattr) setup(t *testing.T) {
+	f.seen = make(chan getxattrSeen, 1)
+}
+
+func (f *getxattr) test(path string, t *testing.T) {
+	buf := make([]byte, 8192)
+	n, err := syscallx.Getxattr(path, "not-there", buf)
+	if err != nil {
+		t.Errorf("unexpected error: %v", err)
+		return
+	}
+	buf = buf[:n]
+	if g, e := string(buf), "hello, world"; g != e {
+		t.Errorf("wrong getxattr content: %#v != %#v", g, e)
+	}
+	close(f.seen)
+	seen := <-f.seen
+	if g, e := seen.name, "not-there"; g != e {
+		t.Errorf("wrong getxattr name: %#v != %#v", g, e)
+	}
+}
+
+// Test Getxattr that has no space to return value
+
+type getxattrTooSmall struct {
+	file
+}
+
+func (f *getxattrTooSmall) Getxattr(req *fuse.GetxattrRequest, resp *fuse.GetxattrResponse, intr Intr) fuse.Error {
+	resp.Xattr = []byte("hello, world")
+	return nil
+}
+
+func (f *getxattrTooSmall) test(path string, t *testing.T) {
+	buf := make([]byte, 3)
+	_, err := syscallx.Getxattr(path, "whatever", buf)
+	if err == nil {
+		t.Error("Getxattr = nil; want some error")
+	}
+	if err != syscall.ERANGE {
+		t.Errorf("unexpected error: %v", err)
+		return
+	}
+}
+
+// Test Getxattr used to probe result size
+
+type getxattrSize struct {
+	file
+}
+
+func (f *getxattrSize) Getxattr(req *fuse.GetxattrRequest, resp *fuse.GetxattrResponse, intr Intr) fuse.Error {
+	resp.Xattr = []byte("hello, world")
+	return nil
+}
+
+func (f *getxattrSize) test(path string, t *testing.T) {
+	n, err := syscallx.Getxattr(path, "whatever", nil)
+	if err != nil {
+		t.Errorf("Getxattr unexpected error: %v", err)
+		return
+	}
+	if g, e := n, len("hello, world"); g != e {
+		t.Errorf("Getxattr incorrect size: %d != %d", g, e)
+	}
+}
+
+// Test Listxattr
+
+type listxattr struct {
+	file
+	seen chan bool
+}
+
+func (f *listxattr) Listxattr(req *fuse.ListxattrRequest, resp *fuse.ListxattrResponse, intr Intr) fuse.Error {
+	f.seen <- true
+	resp.Append("one", "two")
+	return nil
+}
+
+func (f *listxattr) setup(t *testing.T) {
+	f.seen = make(chan bool, 1)
+}
+
+func (f *listxattr) test(path string, t *testing.T) {
+	buf := make([]byte, 8192)
+	n, err := syscallx.Listxattr(path, buf)
+	if err != nil {
+		t.Errorf("unexpected error: %v", err)
+		return
+	}
+	buf = buf[:n]
+	if g, e := string(buf), "one\x00two\x00"; g != e {
+		t.Errorf("wrong listxattr content: %#v != %#v", g, e)
+	}
+	close(f.seen)
+	seen := <-f.seen
+	if g, e := seen, true; g != e {
+		t.Errorf("listxattr not seen: %#v != %#v", g, e)
+	}
+}
+
+// Test Listxattr that has no space to return value
+
+type listxattrTooSmall struct {
+	file
+}
+
+func (f *listxattrTooSmall) Listxattr(req *fuse.ListxattrRequest, resp *fuse.ListxattrResponse, intr Intr) fuse.Error {
+	resp.Xattr = []byte("one\x00two\x00")
+	return nil
+}
+
+func (f *listxattrTooSmall) test(path string, t *testing.T) {
+	buf := make([]byte, 3)
+	_, err := syscallx.Listxattr(path, buf)
+	if err == nil {
+		t.Error("Listxattr = nil; want some error")
+	}
+	if err != syscall.ERANGE {
+		t.Errorf("unexpected error: %v", err)
+		return
+	}
+}
+
+// Test Listxattr used to probe result size
+
+type listxattrSize struct {
+	file
+}
+
+func (f *listxattrSize) Listxattr(req *fuse.ListxattrRequest, resp *fuse.ListxattrResponse, intr Intr) fuse.Error {
+	resp.Xattr = []byte("one\x00two\x00")
+	return nil
+}
+
+func (f *listxattrSize) test(path string, t *testing.T) {
+	n, err := syscallx.Listxattr(path, nil)
+	if err != nil {
+		t.Errorf("Listxattr unexpected error: %v", err)
+		return
+	}
+	if g, e := n, len("one\x00two\x00"); g != e {
+		t.Errorf("Getxattr incorrect size: %d != %d", g, e)
+	}
+}
+
+// Test Setxattr
+
+type setxattrSeen struct {
+	name  string
+	flags uint32
+	value string
+}
+
+type setxattr struct {
+	file
+	seen chan setxattrSeen
+}
+
+func (f *setxattr) Setxattr(req *fuse.SetxattrRequest, intr Intr) fuse.Error {
+	f.seen <- setxattrSeen{
+		name:  req.Name,
+		flags: req.Flags,
+		value: string(req.Xattr),
+	}
+	return nil
+}
+
+func (f *setxattr) setup(t *testing.T) {
+	f.seen = make(chan setxattrSeen, 1)
+}
+
+func (f *setxattr) test(path string, t *testing.T) {
+	err := syscallx.Setxattr(path, "greeting", []byte("hello, world"), 0)
+	if err != nil {
+		t.Errorf("unexpected error: %v", err)
+		return
+	}
+	close(f.seen)
+	want := setxattrSeen{flags: 0, name: "greeting", value: "hello, world"}
+	if g, e := <-f.seen, want; g != e {
+		t.Errorf("setxattr saw %v, want %v", g, e)
+	}
+}
+
+// Test Removexattr
+
+type removexattrSeen struct {
+	name string
+}
+
+type removexattr struct {
+	file
+	seen chan removexattrSeen
+}
+
+func (f *removexattr) Removexattr(req *fuse.RemovexattrRequest, intr Intr) fuse.Error {
+	f.seen <- removexattrSeen{name: req.Name}
+	return nil
+}
+
+func (f *removexattr) setup(t *testing.T) {
+	f.seen = make(chan removexattrSeen, 1)
+}
+
+func (f *removexattr) test(path string, t *testing.T) {
+	err := syscallx.Removexattr(path, "greeting")
+	if err != nil {
+		t.Errorf("unexpected error: %v", err)
+		return
+	}
+	close(f.seen)
+	want := removexattrSeen{name: "greeting"}
+	if g, e := <-f.seen, want; g != e {
+		t.Errorf("removexattr saw %v, want %v", g, e)
 	}
 }

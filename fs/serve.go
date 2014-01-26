@@ -74,17 +74,6 @@ type FSDestroyer interface {
 //
 // Other FUSE requests can be handled by implementing methods from the
 // Node* interfaces, for example NodeOpener.
-//
-// TODO implement methods
-//
-// Getxattr obtains an extended attribute for the receiver.
-// XXX
-//
-// Listxattr lists the extended attributes recorded for the receiver.
-//
-// Removexattr removes an extended attribute from the receiver.
-//
-// Setxattr sets an extended attribute for the receiver.
 type Node interface {
 	Attr() fuse.Attr
 }
@@ -189,6 +178,36 @@ type NodeMknoder interface {
 // TODO this should be on Handle not Node
 type NodeFsyncer interface {
 	Fsync(r *fuse.FsyncRequest, intr Intr) fuse.Error
+}
+
+type NodeGetxattrer interface {
+	// Getxattr gets an extended attribute by the given name from the
+	// node.
+	//
+	// If there is no xattr by that name, returns fuse.ENODATA. This
+	// will be translated to the platform-specific correct error code
+	// by the framework.
+	Getxattr(req *fuse.GetxattrRequest, resp *fuse.GetxattrResponse, intr Intr) fuse.Error
+}
+
+type NodeListxattrer interface {
+	// Listxattr lists the extended attributes recorded for the node.
+	Listxattr(req *fuse.ListxattrRequest, resp *fuse.ListxattrResponse, intr Intr) fuse.Error
+}
+
+type NodeSetxattrer interface {
+	// Setxattr sets an extended attribute with the given name and
+	// value for the node.
+	Setxattr(req *fuse.SetxattrRequest, intr Intr) fuse.Error
+}
+
+type NodeRemovexattrer interface {
+	// Removexattr removes an extended attribute for the name.
+	//
+	// If there is no xattr by that name, returns fuse.ENODATA. This
+	// will be translated to the platform-specific correct error code
+	// by the framework.
+	Removexattr(req *fuse.RemovexattrRequest, intr Intr) fuse.Error
 }
 
 var startTime = time.Now()
@@ -477,7 +496,7 @@ type request struct {
 }
 
 func (r request) String() string {
-	return fmt.Sprintf("<- %s [%s] %s", r.Op, r.Request, r.In)
+	return fmt.Sprintf("<- %s", r.In)
 }
 
 type logResponseHeader struct {
@@ -860,10 +879,81 @@ func (c *serveConn) serve(fs FS, r fuse.Request) {
 		done(s)
 		r.Respond(s)
 
-	case *fuse.GetxattrRequest, *fuse.SetxattrRequest, *fuse.ListxattrRequest, *fuse.RemovexattrRequest:
-		// TODO: Use n.
-		done(fuse.ENOSYS)
-		r.RespondError(fuse.ENOSYS)
+	case *fuse.GetxattrRequest:
+		n, ok := node.(NodeGetxattrer)
+		if !ok {
+			done(fuse.ENOTSUP)
+			r.RespondError(fuse.ENOTSUP)
+			break
+		}
+		s := &fuse.GetxattrResponse{}
+		err := n.Getxattr(r, s, intr)
+		if err != nil {
+			done(err)
+			r.RespondError(err)
+			break
+		}
+		if r.Size != 0 && uint64(len(s.Xattr)) > uint64(r.Size) {
+			done(fuse.ERANGE)
+			r.RespondError(fuse.ERANGE)
+			break
+		}
+		done(s)
+		r.Respond(s)
+
+	case *fuse.ListxattrRequest:
+		n, ok := node.(NodeListxattrer)
+		if !ok {
+			done(fuse.ENOTSUP)
+			r.RespondError(fuse.ENOTSUP)
+			break
+		}
+		s := &fuse.ListxattrResponse{}
+		err := n.Listxattr(r, s, intr)
+		if err != nil {
+			done(err)
+			r.RespondError(err)
+			break
+		}
+		if r.Size != 0 && uint64(len(s.Xattr)) > uint64(r.Size) {
+			done(fuse.ERANGE)
+			r.RespondError(fuse.ERANGE)
+			break
+		}
+		done(s)
+		r.Respond(s)
+
+	case *fuse.SetxattrRequest:
+		n, ok := node.(NodeSetxattrer)
+		if !ok {
+			done(fuse.ENOTSUP)
+			r.RespondError(fuse.ENOTSUP)
+			break
+		}
+		err := n.Setxattr(r, intr)
+		if err != nil {
+			done(err)
+			r.RespondError(err)
+			break
+		}
+		done(nil)
+		r.Respond()
+
+	case *fuse.RemovexattrRequest:
+		n, ok := node.(NodeRemovexattrer)
+		if !ok {
+			done(fuse.ENOTSUP)
+			r.RespondError(fuse.ENOTSUP)
+			break
+		}
+		err := n.Removexattr(r, intr)
+		if err != nil {
+			done(err)
+			r.RespondError(err)
+			break
+		}
+		done(nil)
+		r.Respond()
 
 	case *fuse.ForgetRequest:
 		forget := c.dropNode(hdr.Node, r.N)

@@ -87,7 +87,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"runtime"
 	"sync"
 	"syscall"
 	"time"
@@ -178,15 +177,20 @@ const (
 	// EINTR indicates request was interrupted by an InterruptRequest.
 	// See also fs.Intr.
 	EINTR = Errno(syscall.EINTR)
+
+	ENODATA = Errno(syscall.ENODATA)
+	ERANGE  = Errno(syscall.ERANGE)
+	ENOTSUP = Errno(syscall.ENOTSUP)
 )
 
 var errnoNames = map[Errno]string{
-	ENOSYS: "ENOSYS",
-	ESTALE: "ESTALE",
-	ENOENT: "ENOENT",
-	EIO:    "EIO",
-	EPERM:  "EPERM",
-	EINTR:  "EINTR",
+	ENOSYS:  "ENOSYS",
+	ESTALE:  "ESTALE",
+	ENOENT:  "ENOENT",
+	EIO:     "EIO",
+	EPERM:   "EPERM",
+	EINTR:   "EINTR",
+	ENODATA: "ENODATA",
 }
 
 type errno int
@@ -463,7 +467,10 @@ func (c *Conn) ReadRequest() (Request, error) {
 		req = &MkdirRequest{
 			Header: m.Header(),
 			Name:   string(name[:i]),
-			Mode:   fileMode(in.Mode) | os.ModeDir,
+			// observed on Linux: mkdirIn.Mode & syscall.S_IFMT == 0,
+			// and this causes fileMode to go into it's "no idea"
+			// code branch; enforce type to directory
+			Mode: fileMode((in.Mode &^ syscall.S_IFMT) | syscall.S_IFDIR),
 		}
 
 	case opUnlink, opRmdir:
@@ -512,8 +519,7 @@ func (c *Conn) ReadRequest() (Request, error) {
 		req = &OpenRequest{
 			Header: m.Header(),
 			Dir:    m.hdr.Opcode == opOpendir,
-			Flags:  in.Flags,
-			Mode:   fileMode(in.Mode),
+			Flags:  openFlags(in.Flags),
 		}
 
 	case opRead, opReaddir:
@@ -561,101 +567,73 @@ func (c *Conn) ReadRequest() (Request, error) {
 			Header:       m.Header(),
 			Dir:          m.hdr.Opcode == opReleasedir,
 			Handle:       HandleID(in.Fh),
-			Flags:        in.Flags,
+			Flags:        openFlags(in.Flags),
 			ReleaseFlags: ReleaseFlags(in.ReleaseFlags),
 			LockOwner:    in.LockOwner,
 		}
 
-	case opFsync:
+	case opFsync, opFsyncdir:
 		in := (*fsyncIn)(m.data())
 		if m.len() < unsafe.Sizeof(*in) {
 			goto corrupt
 		}
 		req = &FsyncRequest{
+			Dir:    m.hdr.Opcode == opFsyncdir,
 			Header: m.Header(),
 			Handle: HandleID(in.Fh),
 			Flags:  in.FsyncFlags,
 		}
 
 	case opSetxattr:
-		var size uint32
-		var r *SetxattrRequest
-		if runtime.GOOS == "darwin" {
-			in := (*setxattrInOSX)(m.data())
-			if m.len() < unsafe.Sizeof(*in) {
-				goto corrupt
-			}
-			r = &SetxattrRequest{
-				Flags:    in.Flags,
-				Position: in.Position,
-			}
-			size = in.Size
-			m.off += int(unsafe.Sizeof(*in))
-		} else {
-			in := (*setxattrIn)(m.data())
-			if m.len() < unsafe.Sizeof(*in) {
-				goto corrupt
-			}
-			r = &SetxattrRequest{}
-			size = in.Size
-			m.off += int(unsafe.Sizeof(*in))
+		in := (*setxattrIn)(m.data())
+		if m.len() < unsafe.Sizeof(*in) {
+			goto corrupt
 		}
-		r.Header = m.Header()
+		m.off += int(unsafe.Sizeof(*in))
 		name := m.bytes()
 		i := bytes.IndexByte(name, '\x00')
 		if i < 0 {
 			goto corrupt
 		}
-		r.Name = string(name[:i])
-		r.Xattr = name[i+1:]
-		if uint32(len(r.Xattr)) < size {
+		xattr := name[i+1:]
+		if uint32(len(xattr)) < in.Size {
 			goto corrupt
 		}
-		r.Xattr = r.Xattr[:size]
-		req = r
+		xattr = xattr[:in.Size]
+		req = &SetxattrRequest{
+			Header:   m.Header(),
+			Flags:    in.Flags,
+			Position: in.position(),
+			Name:     string(name[:i]),
+			Xattr:    xattr,
+		}
 
 	case opGetxattr:
-		if runtime.GOOS == "darwin" {
-			in := (*getxattrInOSX)(m.data())
-			if m.len() < unsafe.Sizeof(*in) {
-				goto corrupt
-			}
-			req = &GetxattrRequest{
-				Header:   m.Header(),
-				Size:     in.Size,
-				Position: in.Position,
-			}
-		} else {
-			in := (*getxattrIn)(m.data())
-			if m.len() < unsafe.Sizeof(*in) {
-				goto corrupt
-			}
-			req = &GetxattrRequest{
-				Header: m.Header(),
-				Size:   in.Size,
-			}
+		in := (*getxattrIn)(m.data())
+		if m.len() < unsafe.Sizeof(*in) {
+			goto corrupt
+		}
+		name := m.bytes()[unsafe.Sizeof(*in):]
+		i := bytes.IndexByte(name, '\x00')
+		if i < 0 {
+			goto corrupt
+		}
+		req = &GetxattrRequest{
+			Header:   m.Header(),
+			Name:     string(name[:i]),
+			Size:     in.Size,
+			Position: in.position(),
 		}
 
 	case opListxattr:
-		if runtime.GOOS == "darwin" {
-			in := (*getxattrInOSX)(m.data())
-			if m.len() < unsafe.Sizeof(*in) {
-				goto corrupt
-			}
-			req = &ListxattrRequest{
-				Header:   m.Header(),
-				Size:     in.Size,
-				Position: in.Position,
-			}
-		} else {
-			in := (*getxattrIn)(m.data())
-			if m.len() < unsafe.Sizeof(*in) {
-				goto corrupt
-			}
-			req = &ListxattrRequest{
-				Header: m.Header(),
-				Size:   in.Size,
-			}
+		in := (*getxattrIn)(m.data())
+		if m.len() < unsafe.Sizeof(*in) {
+			goto corrupt
+		}
+		req = &ListxattrRequest{
+			Header:   m.Header(),
+			Size:     in.Size,
+			Position: in.position(),
 		}
 
 	case opRemovexattr:
@@ -694,8 +672,6 @@ func (c *Conn) ReadRequest() (Request, error) {
 			Flags:        InitFlags(in.Flags),
 		}
 
-	case opFsyncdir:
-		panic("opFsyncdir")
 	case opGetlk:
 		panic("opGetlk")
 	case opSetlk:
@@ -714,7 +690,7 @@ func (c *Conn) ReadRequest() (Request, error) {
 		}
 
 	case opCreate:
-		in := (*openIn)(m.data())
+		in := (*createIn)(m.data())
 		if m.len() < unsafe.Sizeof(*in) {
 			goto corrupt
 		}
@@ -725,7 +701,7 @@ func (c *Conn) ReadRequest() (Request, error) {
 		}
 		req = &CreateRequest{
 			Header: m.Header(),
-			Flags:  in.Flags,
+			Flags:  openFlags(in.Flags),
 			Mode:   fileMode(in.Mode),
 			Name:   string(name[:i]),
 		}
@@ -1000,22 +976,42 @@ func (r *GetattrResponse) String() string {
 
 // A GetxattrRequest asks for the extended attributes associated with r.Node.
 type GetxattrRequest struct {
-	Header   `json:"-"`
-	Size     uint32 // maximum size to return
-	Position uint32 // offset within extended attributes
+	Header `json:"-"`
+
+	// Maximum size to return.
+	Size uint32
+
+	// Name of the attribute requested.
+	Name string
+
+	// Offset within extended attributes.
+	//
+	// Only valid for OS X, and then only with the resource fork
+	// attribute.
+	Position uint32
 }
 
 func (r *GetxattrRequest) String() string {
-	return fmt.Sprintf("Getxattr [%s] %d @%d", &r.Header, r.Size, r.Position)
+	return fmt.Sprintf("Getxattr [%s] %q %d @%d", &r.Header, r.Name, r.Size, r.Position)
 }
 
 // Respond replies to the request with the given response.
 func (r *GetxattrRequest) Respond(resp *GetxattrResponse) {
-	out := &getxattrOut{
-		outHeader: outHeader{Unique: uint64(r.ID)},
-		Size:      uint32(len(resp.Xattr)),
+	if r.Size == 0 {
+		out := &getxattrOut{
+			outHeader: outHeader{Unique: uint64(r.ID)},
+			Size:      uint32(len(resp.Xattr)),
+		}
+		r.Conn.respond(&out.outHeader, unsafe.Sizeof(*out))
+	} else {
+		out := &outHeader{Unique: uint64(r.ID)}
+		r.Conn.respondData(out, unsafe.Sizeof(*out), resp.Xattr)
 	}
-	r.Conn.respondData(&out.outHeader, unsafe.Sizeof(*out), resp.Xattr)
+}
+
+func (r *GetxattrRequest) RespondError(err Error) {
+	err = translateGetxattrError(err)
+	r.Header.RespondError(err)
 }
 
 // A GetxattrResponse is the response to a GetxattrRequest.
@@ -1040,11 +1036,16 @@ func (r *ListxattrRequest) String() string {
 
 // Respond replies to the request with the given response.
 func (r *ListxattrRequest) Respond(resp *ListxattrResponse) {
-	out := &getxattrOut{
-		outHeader: outHeader{Unique: uint64(r.ID)},
-		Size:      uint32(len(resp.Xattr)),
+	if r.Size == 0 {
+		out := &getxattrOut{
+			outHeader: outHeader{Unique: uint64(r.ID)},
+			Size:      uint32(len(resp.Xattr)),
+		}
+		r.Conn.respond(&out.outHeader, unsafe.Sizeof(*out))
+	} else {
+		out := &outHeader{Unique: uint64(r.ID)}
+		r.Conn.respondData(out, unsafe.Sizeof(*out), resp.Xattr)
 	}
-	r.Conn.respondData(&out.outHeader, unsafe.Sizeof(*out), resp.Xattr)
 }
 
 // A ListxattrResponse is the response to a ListxattrRequest.
@@ -1054,6 +1055,14 @@ type ListxattrResponse struct {
 
 func (r *ListxattrResponse) String() string {
 	return fmt.Sprintf("Listxattr %x", r.Xattr)
+}
+
+// Append adds an extended attribute name to the response.
+func (r *ListxattrResponse) Append(names ...string) {
+	for _, name := range names {
+		r.Xattr = append(r.Xattr, name...)
+		r.Xattr = append(r.Xattr, '\x00')
+	}
 }
 
 // A RemovexattrRequest asks to remove an extended attribute associated with r.Node.
@@ -1072,13 +1081,34 @@ func (r *RemovexattrRequest) Respond() {
 	r.Conn.respond(out, unsafe.Sizeof(*out))
 }
 
+func (r *RemovexattrRequest) RespondError(err Error) {
+	err = translateGetxattrError(err)
+	r.Header.RespondError(err)
+}
+
 // A SetxattrRequest asks to set an extended attribute associated with a file.
 type SetxattrRequest struct {
-	Header   `json:"-"`
-	Flags    uint32
-	Position uint32 // OS X only
-	Name     string
-	Xattr    []byte
+	Header `json:"-"`
+
+	// Flags can make the request fail if attribute does/not already
+	// exist. Unfortunately, the constants are platform-specific and
+	// not exposed by Go1.2. Look for XATTR_CREATE, XATTR_REPLACE.
+	//
+	// TODO improve this later
+	//
+	// TODO XATTR_CREATE and exist -> EEXIST
+	//
+	// TODO XATTR_REPLACE and not exist -> ENODATA
+	Flags uint32
+
+	// Offset within extended attributes.
+	//
+	// Only valid for OS X, and then only with the resource fork
+	// attribute.
+	Position uint32
+
+	Name  string
+	Xattr []byte
 }
 
 func (r *SetxattrRequest) String() string {
@@ -1089,6 +1119,11 @@ func (r *SetxattrRequest) String() string {
 func (r *SetxattrRequest) Respond() {
 	out := &outHeader{Unique: uint64(r.ID)}
 	r.Conn.respond(out, unsafe.Sizeof(*out))
+}
+
+func (r *SetxattrRequest) RespondError(err Error) {
+	err = translateGetxattrError(err)
+	r.Header.RespondError(err)
 }
 
 // A LookupRequest asks to look up the given name in the directory named by r.Node.
@@ -1133,12 +1168,11 @@ func (r *LookupResponse) String() string {
 type OpenRequest struct {
 	Header `json:"-"`
 	Dir    bool // is this Opendir?
-	Flags  uint32
-	Mode   os.FileMode
+	Flags  OpenFlags
 }
 
 func (r *OpenRequest) String() string {
-	return fmt.Sprintf("Open [%s] dir=%v fl=%v mode=%v", &r.Header, r.Dir, r.Flags, r.Mode)
+	return fmt.Sprintf("Open [%s] dir=%v fl=%v", &r.Header, r.Dir, r.Flags)
 }
 
 // Respond replies to the request with the given response.
@@ -1154,7 +1188,7 @@ func (r *OpenRequest) Respond(resp *OpenResponse) {
 // A OpenResponse is the response to a OpenRequest.
 type OpenResponse struct {
 	Handle HandleID
-	Flags  OpenFlags
+	Flags  OpenResponseFlags
 }
 
 func (r *OpenResponse) String() string {
@@ -1165,7 +1199,7 @@ func (r *OpenResponse) String() string {
 type CreateRequest struct {
 	Header `json:"-"`
 	Name   string
-	Flags  uint32
+	Flags  OpenFlags
 	Mode   os.FileMode
 }
 
@@ -1282,7 +1316,7 @@ type ReleaseRequest struct {
 	Header       `json:"-"`
 	Dir          bool // is this Releasedir?
 	Handle       HandleID
-	Flags        uint32 // flags from OpenRequest
+	Flags        OpenFlags // flags from OpenRequest
 	ReleaseFlags ReleaseFlags
 	LockOwner    uint32
 }
@@ -1697,7 +1731,9 @@ func (r *MknodRequest) Respond(resp *LookupResponse) {
 type FsyncRequest struct {
 	Header `json:"-"`
 	Handle HandleID
-	Flags  uint32
+	// TODO bit 1 is datasync, not well documented upstream
+	Flags uint32
+	Dir   bool
 }
 
 func (r *FsyncRequest) String() string {
